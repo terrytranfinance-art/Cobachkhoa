@@ -451,6 +451,18 @@ input[type=range]::-moz-range-thumb{width:32px;height:32px;border-radius:50%;bac
 #voDbg .vdH b{flex:1 1 auto;font-size:14px}
 #voDbg .vdH button{min-height:34px;padding:0 10px;border-radius:8px;border:1px solid #4a6a78;background:#1d2f3a;color:#e8f2f5;font-size:13px}
 #voDbg pre{flex:1 1 auto;margin:0;padding:8px;overflow:auto;-webkit-overflow-scrolling:touch;font:11px/1.4 ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-word}
+/* v3: "Bật tiếng" sound banner */
+#naBanner{position:fixed;z-index:61;left:50%;transform:translateX(-50%);top:calc(env(safe-area-inset-top,0px) + 70px);width:min(94vw,520px);display:flex;align-items:center;gap:6px;
+  background:#fff7e0;border:2px solid #f0b43c;color:#5a3d06;border-radius:16px;padding:6px 6px 6px 10px;box-shadow:0 6px 22px rgba(0,0,0,.28);font-size:15px;line-height:1.3}
+#naBanner .naGo{flex:1 1 auto;display:flex;align-items:center;gap:8px;border:0;background:transparent;color:inherit;font:inherit;text-align:left;padding:4px 0;min-height:44px}
+#naBanner .naI{flex:none;font-size:22px}
+#naBanner .naT{flex:1 1 auto}
+#naBanner .naB{flex:none;background:#e8901a;color:#fff;border-radius:12px;padding:9px 12px;font-size:15px;white-space:nowrap}
+#naBanner .naX{flex:none;width:36px;height:36px;border:0;background:transparent;font-size:22px;line-height:1;color:inherit;border-radius:18px}
+#naBanner.off{background:#fff1ec;border-color:#e2603a;color:#7a2a12;animation:naPulse 1.6s ease-in-out infinite}
+#naBanner.off .naB{background:#d9481f}
+@keyframes naPulse{0%,100%{box-shadow:0 6px 22px rgba(0,0,0,.28)}50%{box-shadow:0 6px 22px rgba(226,96,58,.6)}}
+@media (prefers-reduced-motion: reduce){#naBanner.off{animation:none}}
 </style>
 </head>
 <body>
@@ -616,27 +628,56 @@ function glow(c,x,y,r,col,a){ var g=c.createRadialGradient(x,y,r*.2,x,y,r); g.ad
 function label(c,txt,x,y,size,align){ c.font="600 "+(size||13)+"px -apple-system,BlinkMacSystemFont,Roboto,'Noto Sans',sans-serif"; c.textAlign=align||"center"; c.textBaseline="middle";
   c.lineWidth=3; c.strokeStyle="rgba(0,0,0,.75)"; c.strokeText(txt,x,y); c.fillStyle="#eef3f6"; c.fillText(txt,x,y); }
 
-/* ---------- narration (v2: Web Audio API instead of <audio>) ----------
-   iOS 26 WebKit bug 317741/321436: after an <audio> element has played, the next SpeechRecognition.start() can hang with no
-   events. All narration/feedback now plays through the one AudioContext (unlocked on the first tap). Each clip is decoded
-   from base64 lazily the first time it is needed and the AudioBuffer is cached. <audio> is only a fallback for browsers
-   without Web Audio. */
+/* ---------- narration (v3: Web Audio + iOS audio session, with an <audio> element fallback) ----------
+   v2 moved narration to the Web Audio API because of iOS 26 WebKit bugs 317741/321436 (after an <audio> element has played,
+   the next SpeechRecognition.start() can hang). But WebKit puts a page that only uses Web Audio in the AVAudioSession
+   category "AmbientSound" (MediaSessionManagerCocoa::updateSessionState), which the Ring/Silent switch MUTES. <audio>
+   elements use "MediaPlayback", which the switch does not mute; that is why v1 was audible and v2 was silent on iPhones in
+   silent mode. v3:
+   - navigator.audioSession.type="playback" (iOS 17+) is set at page load, before the AudioContext exists, and again before
+     each clip; it is switched to "auto" while the mic/recognizer runs (a "playback" override would block capture, since the
+     override wins over WebKit's automatic PlayAndRecord) and back to "playback" for the next clip.
+   - iOS without navigator.audioSession (iOS 16 and older): narration uses the <audio> element (+ a looping silent <audio>
+     so the Web Audio sound effects are audible too).
+   - Web Audio failures fall back per clip to the <audio> element: decode error, context not "running", or the context clock
+     not advancing 1 s after start(). If the element is blocked (no user gesture) a "Bật tiếng" banner appears; its tap
+     replays the clip through <audio> and keeps <audio> for the rest of the lesson (remembered on this device).
+   - "Không nghe tiếng cô?" hint during the first clip (silent-switch muting cannot be detected from a web page).
+   - ?audio=el / ?audio=wa forces a path; every step is logged to the debug panel (tap the title 5 times). */
 var voice=$("voice"), urls={}, curKey=null, onEndCb=null, soundOn=true, autoOn=true, unlocked=false;
-Object.keys(AUDIO).forEach(function(k){ urls[k]=true; }); // "has a clip" map (blob URLs are no longer created up front)
+Object.keys(AUDIO).forEach(function(k){ urls[k]=true; }); // "has a clip" map (clips are decoded / turned into blob URLs lazily)
 var VLOG=[], VT0=Date.now();
 function voLog(m){ var line=((Date.now()-VT0)/1000).toFixed(1)+"s "+m; VLOG.push(line); if(VLOG.length>300) VLOG.shift(); try{ console.log("[voice] "+m); }catch(e){} if(window.voDbgPaint) voDbgPaint(); }
-var NA={buf:{},pend:{},src:null,t0:0,tok:0,iv:null,wd:null,path:(window.AudioContext||window.webkitAudioContext)?"webaudio":"audio-element",decoded:0};
+var ASES=null; try{ ASES=navigator.audioSession||null; }catch(e){}
+function asSet(t,why){ if(!ASES) return; try{ if(ASES.type!==t){ ASES.type=t; voLog("audioSession.type = "+ASES.type+" ("+why+")"); } }catch(e){ voLog("audioSession.type = "+t+" failed: "+e); } }
+function asDesc(){ if(!ASES) return "n/a"; try{ return ASES.type+"/"+ASES.state; }catch(e){ return "?"; } }
+asSet("playback","page load, before any AudioContext");
+var NA_IOS=/iP(hone|ad|od)/.test(navigator.userAgent||"")||(navigator.platform==="MacIntel"&&navigator.maxTouchPoints>1);
+var NA={buf:{},pend:{},blob:{},src:null,t0:0,tok:0,iv:null,wd:null,chk:null,decoded:0,elPrimed:false,sil:null,silOn:false,lastKey:null,lastCb:null,starts:0,elStarts:0,waStarts:0,hinted:false,why:""};
+(function(){ var q=(location.search+location.hash).match(/audio=(el|wa)/), s=null; try{ s=localStorage.getItem("na_path"); }catch(e){}
+  if(!(window.AudioContext||window.webkitAudioContext)){ NA.path="audio-element"; NA.why="no Web Audio"; }
+  else if(q){ NA.path=q[1]==="el"?"audio-element":"webaudio"; NA.why="?audio="+q[1]; }
+  else if(s==="audio-element"){ NA.path=s; NA.why="chosen with 'Bật tiếng' on this device"; }
+  else if(NA_IOS&&!ASES){ NA.path="audio-element"; NA.why="iOS without navigator.audioSession: Web Audio would follow the silent switch"; }
+  else { NA.path="webaudio"; NA.why=ASES?"audioSession available":"not iOS"; }
+  voLog("narration path: "+NA.path+" ("+NA.why+"), audioSession "+asDesc()); })();
+/* tiny silent WAV (8 kHz, 8-bit, 0.5 s) for unlocking <audio> elements inside a tap */
+var SIL_WAV=(function(){ var n=4000,h="RIFF",s=""; function u32(v){ return String.fromCharCode(v&255,(v>>8)&255,(v>>16)&255,(v>>24)&255); } function u16(v){ return String.fromCharCode(v&255,(v>>8)&255); }
+  s=h+u32(36+n)+"WAVEfmt "+u32(16)+u16(1)+u16(1)+u32(8000)+u32(8000)+u16(1)+u16(8)+"data"+u32(n); for(var i=0;i<n;i++) s+="\x80"; return "data:audio/wav;base64,"+btoa(s); })();
+function naResume(a,why){ try{ var p=a.resume(); if(p&&p.catch) p.catch(function(e){ voLog("AudioContext resume() rejected ("+why+"): "+(e&&e.name)); }); }catch(e){} }
 function b64ToAB(s){ var b=atob(s),n=b.length,u=new Uint8Array(n); for(var i=0;i<n;i++) u[i]=b.charCodeAt(i); return u.buffer; }
+function elUrl(k){ if(!NA.blob[k]){ try{ NA.blob[k]=URL.createObjectURL(new Blob([b64ToAB(AUDIO[k])],{type:"audio/mpeg"})); }catch(e){ NA.blob[k]="data:audio/mpeg;base64,"+AUDIO[k]; } } return NA.blob[k]; }
+function naDecode(a,ab){ return new Promise(function(res,rej){ var done=false; function ok(b){ if(!done){ done=true; res(b); } } function bad(e){ if(!done){ done=true; rej(e||new Error("decode failed")); } }
+  try{ var p=a.decodeAudioData(ab,ok,bad); if(p&&p.then) p.then(ok,bad); }catch(e){ bad(e); } }); } // callback form for older WebKit, promise form where it exists
 function naBuf(k,ok,bad){ if(NA.buf[k]){ ok(NA.buf[k]); return; } var a=actx(); if(!a){ bad(new Error("no AudioContext")); return; }
   if(NA.pend[k]){ NA.pend[k].push([ok,bad]); return; } NA.pend[k]=[[ok,bad]];
-  var done=false; function fin(buf,err){ if(done) return; done=true; var L=NA.pend[k]; delete NA.pend[k]; if(buf){ NA.buf[k]=buf; NA.decoded++; }
-    L.forEach(function(c){ if(buf) c[0](buf); else c[1](err); }); }
-  try{ var p=a.decodeAudioData(b64ToAB(AUDIO[k]),function(b){ fin(b); },function(e){ fin(null,e||new Error("decode")); }); if(p&&p.catch) p.catch(function(e){ fin(null,e); }); }
-  catch(e){ fin(null,e); } }
-function naPrefetch(k){ if(ac&&AUDIO[k]&&!NA.buf[k]) naBuf(k,function(){},function(){}); }
-function naKill(){ NA.tok++; clearInterval(NA.iv); clearTimeout(NA.wd); var s=NA.src; NA.src=null;
+  function fin(buf,err){ var L=NA.pend[k]; delete NA.pend[k]; if(buf){ NA.buf[k]=buf; NA.decoded++; } L.forEach(function(c){ if(buf) c[0](buf); else c[1](err); }); }
+  naDecode(a,b64ToAB(AUDIO[k])).then(function(b){ fin(b); },function(e){ fin(null,e); }); }
+function naPrefetch(k){ if(ac&&NA.path==="webaudio"&&AUDIO[k]&&!NA.buf[k]) naBuf(k,function(){},function(){}); }
+function naStopOut(){ clearInterval(NA.iv); clearTimeout(NA.wd); clearTimeout(NA.chk); var s=NA.src; NA.src=null;
   if(s){ s.onended=null; try{ s.stop(); }catch(e){} try{ s.disconnect(); }catch(e){} }
-  if(NA.path!=="webaudio") try{ voice.pause(); }catch(e){} }
+  voice.onended=voice.ontimeupdate=voice.onerror=null; if(voice.src&&voice.src!==SIL_WAV) try{ voice.pause(); }catch(e){} }
+function naKill(){ NA.tok++; naStopOut(); }
 function speakFallback(k,cb){ if(!window.speechSynthesis){ if(cb) cb(); return; } var u=new SpeechSynthesisUtterance(SCRIPT[k]); var en=/^(E_|ES_|ET_|R\d)/.test(k); u.lang=en?"en-US":"vi-VN"; u.rate=en?.8:.9;
   var vs=speechSynthesis.getVoices().filter(function(v){return en?/^en/i.test(v.lang):/^vi/i.test(v.lang);}); if(vs.length) u.voice=vs[0];
   u.onend=function(){$("speak").classList.remove("playing"); if(cb) cb();}; speechSynthesis.speak(u); $("speak").classList.add("playing"); }
@@ -650,25 +691,81 @@ function naSync(k,t){ var b=BOUNDS[k]; if(!b||!capKey||capKey!==k) return; var i
   for(var i=0;i<b.length;i++) if(t>=b[i][0]-.05) idx=i; markSentence(idx); if(SCR[page].onSentence) SCR[page].onSentence(k,idx); }
 function play(k,cb,noCaption){
   if(!inSeq) SQ++; stopVoice(); if(!noCaption) setCaption(k); if(!soundOn||!AUDIO[k]){ if(cb) setTimeout(cb,400); return; }
-  curKey=k; onEndCb=cb||null; $("speak").classList.add("playing"); var tok=NA.tok, a=actx();
-  if(!a){ playEl(k,tok); return; }
+  curKey=k; onEndCb=cb||null; NA.lastKey=k; NA.lastCb=cb||null; NA.starts++; $("speak").classList.add("playing"); var tok=NA.tok;
+  asSet("playback","clip "+k);
+  if(NA.path!=="webaudio"){ playEl(k,tok,""); return; }
+  var a=actx(); if(!a){ playEl(k,tok,"no AudioContext"); return; }
   naBuf(k,function(buf){ if(tok!==NA.tok) return;
-      if(a.state!=="running") try{ a.resume(); }catch(e){}
+      if(a.state!=="running") naResume(a,"clip "+k);
       var s=a.createBufferSource(); s.buffer=buf; s.connect(a.destination); s.onended=function(){ naEnd(tok); }; NA.src=s;
-      s.start(0); NA.t0=a.currentTime;
+      s.start(0); NA.t0=a.currentTime; NA.waStarts++; voLog("play "+k+" via Web Audio (ctx "+a.state+", audioSession "+asDesc()+")");
       NA.iv=setInterval(function(){ naSync(k,a.currentTime-NA.t0); },90);
+      // the context can be suspended/interrupted or not unlocked: if its clock does not move, play this clip with <audio>
+      NA.chk=setTimeout(function(){ if(tok!==NA.tok) return; var adv=a.currentTime-NA.t0;
+        if(a.state==="running"&&adv>.3){ naHintOnce(); return; }
+        voLog("Web Audio not playing "+k+" (ctx "+a.state+", clock +"+adv.toFixed(2)+" s) -> <audio> fallback"); naStopOut(); NA.path="audio-element"; NA.why="AudioContext not running after start";
+        playEl(k,tok,"Web Audio not running"); },1000);
       // onended can be lost when iOS interrupts/suspends the context: never let the lesson stall
       NA.wd=setTimeout(function(){ voLog("audio watchdog ended "+k+" (ctx "+a.state+")"); naEnd(tok); },buf.duration*1000+2500); },
-    function(err){ if(tok!==NA.tok) return; voLog("decode failed "+k+": "+(err&&err.message)); $("speak").classList.remove("playing");
-      speakFallback(k,function(){ naEnd(tok); }); });
+    function(err){ if(tok!==NA.tok) return; voLog("decode failed "+k+": "+(err&&(err.name||err.message))+" -> <audio> fallback"); playEl(k,tok,"decode failed"); });
 }
-function playEl(k,tok){ // no Web Audio at all (very old browsers)
-  voice.onended=function(){ naEnd(tok); }; voice.ontimeupdate=function(){ if(tok===NA.tok) naSync(k,voice.currentTime); };
-  voice.src="data:audio/mpeg;base64,"+AUDIO[k]; var pr=voice.play();
-  if(pr&&pr.catch) pr.catch(function(err){ if(tok!==NA.tok) return; $("speak").classList.remove("playing"); if(err&&err.name==="NotSupportedError") speakFallback(k,function(){ naEnd(tok); }); }); }
-/* keep the one AudioContext alive: iOS can leave it "suspended"/"interrupted" (calls, Siri, the mic); any tap resumes it */
-["touchend","click"].forEach(function(ev){ document.addEventListener(ev,function(){ if(ac&&ac.state!=="running"){ try{ ac.resume(); }catch(e){} } },true); });
-document.addEventListener("visibilitychange",function(){ if(!document.hidden&&ac&&ac.state!=="running") try{ ac.resume(); }catch(e){} });
+function playEl(k,tok,why){ var v=voice, t0=Date.now(), dur=0; NA.elStarts++;
+  try{ v.setAttribute("playsinline",""); }catch(e){}
+  v.onended=function(){ if(tok===NA.tok){ voLog("<audio> ended "+k); naEnd(tok); } };
+  v.ontimeupdate=function(){ if(tok===NA.tok){ dur=v.duration||dur; naSync(k,v.currentTime); } };
+  v.onerror=function(){ if(tok!==NA.tok) return; voLog("<audio> error "+k+" (code "+(v.error&&v.error.code)+") -> speech synthesis"); naStopOut(); speakFallback(k,function(){ naEnd(tok); }); };
+  v.src=elUrl(k); var pr; voLog("play "+k+" via <audio>"+(why?" ("+why+")":"")+", audioSession "+asDesc());
+  try{ pr=v.play(); }catch(e){ pr=Promise.reject(e); }
+  if(pr&&pr.then) pr.then(function(){ if(tok!==NA.tok) return; NA.elPrimed=true; naBannerHide("off"); voLog("<audio> playing "+k); },
+    function(err){ if(tok!==NA.tok) return; var n=err&&err.name; voLog("<audio> play() rejected "+k+": "+n);
+      if(n==="NotAllowedError"){ naNeedTap(k); } else if(n==="NotSupportedError"){ naStopOut(); speakFallback(k,function(){ naEnd(tok); }); } });
+  // stalled element: no progress after 4 s -> ask for a tap (never silent without telling the parent)
+  NA.chk=setTimeout(function(){ if(tok!==NA.tok) return; if(!(v.currentTime>0)){ voLog("<audio> not progressing "+k+" (paused "+v.paused+", readyState "+v.readyState+")"); naNeedTap(k); } else if(NA.path==="audio-element") naHintOnce(); },4000);
+  NA.wd=setTimeout(function wd(){ if(tok!==NA.tok) return; var d=v.duration; if(isFinite(d)&&d>0&&v.currentTime<d-.3&&Date.now()-t0<(d+20)*1000){ NA.wd=setTimeout(wd,1500); return; }
+    if(v.currentTime>0&&(!isFinite(d)||v.currentTime>=d-.3)){ voLog("<audio> watchdog ended "+k); naEnd(tok); } else NA.wd=setTimeout(wd,1500); },6000);
+}
+/* ---- unlock inside every tap until everything is running (synchronous: no await before resume/start/play) ---- */
+function naMicBusy(){ return typeof VO!=="undefined"&&!!(VO.rec||(VO.ctx&&(VO.ctx.st==="prep"||VO.ctx.st==="listen"))); }
+function naGesture(ev){
+  if(!naMicBusy()) asSet("playback","tap");
+  var a=actx(); // creates the context on the first tap (after the audioSession type is set) and calls resume()
+  if(a&&!NA.tick){ NA.tick=true; try{ var b=a.createBuffer(1,1,22050),s=a.createBufferSource(); s.buffer=b; s.connect(a.destination); s.start(0); }catch(e){ voLog("1-sample unlock failed: "+e); } }
+  if(a&&a.state!=="running"){ try{ var p=a.resume(); if(p&&p.then) p.then(function(){ voLog("AudioContext resumed in tap ("+a.state+")"); },function(e){ voLog("AudioContext resume rejected: "+(e&&e.name)); }); }catch(e){} }
+  if(NA.path==="audio-element"){
+    if(!NA.elPrimed&&!curKey){ NA.elPrimed=true; try{ voice.src=SIL_WAV; var p2=voice.play(); if(p2&&p2.then) p2.then(function(){ voLog("<audio> unlocked in tap"); },function(e){ if(e&&e.name==="NotAllowedError") NA.elPrimed=false; voLog("<audio> unlock: "+(e&&e.name)); }); }catch(e){} }
+    if(!ASES&&!NA.silOn&&!naMicBusy()) naSilent(true,"tap"); }
+}
+/* looping silent <audio> (only without navigator.audioSession): puts the page in the media-playback session so Web Audio
+   sound effects are not muted by the silent switch; paused while the mic is in use */
+function naSilent(on,why){ if(on){ if(!NA.sil){ NA.sil=new Audio(); NA.sil.loop=true; NA.sil.src=SIL_WAV; try{ NA.sil.setAttribute("playsinline",""); }catch(e){} }
+    NA.silOn=true; try{ var p=NA.sil.play(); if(p&&p.then) p.then(function(){ voLog("silent <audio> loop on ("+why+")"); },function(e){ NA.silOn=false; voLog("silent <audio> loop failed: "+(e&&e.name)); }); }catch(e){ NA.silOn=false; } }
+  else if(NA.sil&&NA.silOn){ NA.silOn=false; try{ NA.sil.pause(); }catch(e){} voLog("silent <audio> loop off ("+why+")"); } }
+/* the mic is about to be used: let WebKit pick PlayAndRecord (a "playback" override would win over capture) */
+function naForMic(why){ asSet("auto","mic: "+why); naSilent(false,"mic"); }
+/* after the start tap: if the context is not running, offer the button */
+function naCheckAfterStart(){ setTimeout(function(){ var st=ac?ac.state:"none"; voLog("1 s after first tap: AudioContext "+st+", narration "+NA.path+", audioSession "+asDesc());
+  if(NA.path==="webaudio"&&ac&&ac.state!=="running") naNeedTap(NA.lastKey); },1000); }
+/* "Bật tiếng" banner: strong (sound is blocked) or a soft hint (cannot detect the silent switch) */
+function naNeedTap(k){ voLog("sound needs a tap -> 'Bật tiếng' banner"+(k?" (clip "+k+")":"")); NA.needKey=k||NA.lastKey; NA.needCb=k&&k===NA.lastKey?NA.lastCb:null; naBanner("off"); }
+function naHintOnce(){ if(NA.hinted||!NA_IOS) return; NA.hinted=true; /* only iPhone/iPad have the silent-switch problem */ try{ if(sessionStorage.getItem("na_hint_x")) return; }catch(e){} naBanner("hint"); setTimeout(function(){ naBannerHide("hint"); },14000); }
+function naBanner(kind){ var b=$("naBanner");
+  if(!b){ b=document.createElement("div"); b.id="naBanner"; b.setAttribute("role","alert");
+    b.innerHTML='<button class="naGo"><span class="naI">🔈</span><span class="naT"></span><b class="naB">Bật tiếng</b></button><button class="naX" aria-label="Đóng">×</button>'; document.body.appendChild(b);
+    b.querySelector(".naGo").addEventListener("click",naTapSound);
+    b.querySelector(".naX").addEventListener("click",function(){ try{ if(b.dataset.k==="hint") sessionStorage.setItem("na_hint_x","1"); }catch(e){} b.remove(); voLog("sound banner closed"); }); }
+  if(b.dataset.k==="off"&&kind==="hint") return; b.dataset.k=kind; b.className=kind;
+  b.querySelector(".naT").textContent=kind==="off"?"Chưa nghe được tiếng cô. Chạm vào đây để nghe nhé.":"Không nghe tiếng cô? (máy đang tắt chuông?) Chạm vào đây.";
+  voLog("sound banner shown: "+kind); }
+function naBannerHide(kind){ var b=$("naBanner"); if(b&&(!kind||b.dataset.k===kind)) b.remove(); }
+function naTapSound(){ // a user gesture: everything here runs synchronously
+  voLog("'Bật tiếng' tapped: switching narration to <audio> (remembered on this device)");
+  NA.path="audio-element"; NA.why="chosen with 'Bật tiếng'"; try{ localStorage.setItem("na_path","audio-element"); }catch(e){}
+  if(!soundOn&&window.setSound) setSound(true); NA.elPrimed=false; naGesture(); naBannerHide();
+  var k=NA.needKey||curKey||NA.lastKey, cb=NA.needKey?NA.needCb:(curKey?onEndCb:NA.lastCb); NA.needKey=null;
+  if(k&&AUDIO[k]){ inSeq=true; play(k,cb,true); inSeq=false; } else { voice.src=SIL_WAV; try{ voice.play(); }catch(e){} }
+  if(window.voDbgPaint) voDbgPaint(); }
+["touchend","click"].forEach(function(ev){ document.addEventListener(ev,function(e){ naGesture(e); },true); });
+document.addEventListener("visibilitychange",function(){ if(!document.hidden&&ac&&ac.state!=="running") naResume(ac,"page visible"); });
 var capKey=null;
 function markSentence(i){ var s=$("capText").querySelectorAll(".sen"); for(var j=0;j<s.length;j++){ var on=j===i; s[j].classList.toggle("now",on);
   if(on){ var sc=$("capScroll"), top=s[j].offsetTop-sc.offsetTop; if(top<sc.scrollTop||top>sc.scrollTop+sc.clientHeight-30) sc.scrollTop=Math.max(0,top-8); } } }
@@ -682,7 +779,7 @@ function setCaption(k){
 
 /* ---------- WebAudio effects ---------- */
 var ac=null;
-function actx(){ if(!ac){ var C=window.AudioContext||window.webkitAudioContext; if(!C) return null; ac=new C(); try{ ac.onstatechange=function(){ voLog("AudioContext "+ac.state); }; }catch(e){} voLog("AudioContext created ("+ac.state+")"); } if(ac.state!=="running") ac.resume(); return ac; }
+function actx(){ if(!ac){ var C=window.AudioContext||window.webkitAudioContext; if(!C) return null; ac=new C(); try{ ac.onstatechange=function(){ voLog("AudioContext "+ac.state); }; }catch(e){} voLog("AudioContext created ("+ac.state+")"); } if(ac.state!=="running") try{ var rp=ac.resume(); if(rp&&rp.catch) rp.catch(function(e){ voLog("AudioContext resume() rejected: "+(e&&e.name)); }); }catch(e){} return ac; }
 function tone(f,dur,vol,delay,f2,type){ if(!soundOn) return; var a=actx(); if(!a) return; var t=a.currentTime+(delay||0),o=a.createOscillator(),gn=a.createGain();
   o.type=type||"sine"; o.frequency.setValueAtTime(f,t); if(f2) o.frequency.exponentialRampToValueAtTime(f2,t+dur);
   gn.gain.setValueAtTime(.0001,t); gn.gain.exponentialRampToValueAtTime(vol,t+.01); gn.gain.exponentialRampToValueAtTime(.0001,t+dur);
@@ -1493,7 +1590,7 @@ function voReady(){ var c=VO.ctx; if(!c||c.answered||!voOK()) return;
   if(VO.perm&&!VO.flaky){ voState(c,"prep"); var g=VO.gen; setTimeout(function(){ if(g===VO.gen&&VO.ctx===c&&!c.answered) voListen(); },300); } // let the audio session settle after narration
   else voState(c,"ready"); }
 /* step 1 of listening: settle the mic permission once with getUserMedia (then stop the tracks) */
-function voListen(){ var c=VO.ctx; if(!c||c.answered||!voOK()) return; voStop();
+function voListen(){ var c=VO.ctx; if(!c||c.answered||!voOK()) return; voStop(); naForMic("listen "+c.key);
   if(VO.primed||!ENV.gum){ voAttempt(c); return; }
   var g=VO.gen, settled=false; voState(c,"prep"); voLog("getUserMedia (first mic use)");
   function go(){ if(settled) return; settled=true; VO.primed=true; if(g!==VO.gen||VO.ctx!==c||c.answered) return; voT(function(){ voAttempt(c); },150); }
@@ -1509,7 +1606,7 @@ function voListen(){ var c=VO.ctx; if(!c||c.answered||!voOK()) return; voStop();
 function voAttempt(c){ if(!c||c.answered||!voOK()) return; VO.gen++; var g=VO.gen, r, n=VO.hangs;
   try{ r=new SRC(); }catch(e){ voDisable("none"); return; }
   r.lang=c.lang; r.interimResults=true; r.continuous=false; r.maxAlternatives=5;
-  var A={r:r,started:false,res:false,ended:false,stopAsked:false,finals:[],interims:[]}; VO.rec=r; VO.att=A;
+  naForMic("recognizer"); var A={r:r,started:false,res:false,ended:false,stopAsked:false,finals:[],interims:[]}; VO.rec=r; VO.att=A;
   voState(c,"listen"); c.tr.textContent="🎤 …";
   function mine(){ return g===VO.gen&&VO.ctx===c&&!c.answered; }
   function clearT(){ VO.tm.forEach(clearTimeout); VO.tm=[]; }
@@ -1625,22 +1722,23 @@ $("goBtn").addEventListener("click",function(){ var n=$("voStart"); if(n) n.styl
 /* ---- hidden debug panel: tap the title 5 times ---- */
 (function(){ var taps=[], d=null;
   function paint(){ if(!d||!d.classList.contains("on")) return;
-    var info={path:VO.why?"tap/parent only ("+VO.why+")":"voice"+(VO.warn?" + warning "+VO.warn:""),narration:NA.path,audioCtx:ac?ac.state:"not created",decoded:NA.decoded,
+    var info={path:VO.why?"tap/parent only ("+VO.why+")":"voice"+(VO.warn?" + warning "+VO.warn:""),narration:NA.path,narrationWhy:NA.why,audioSession:asDesc(),audioCtx:ac?ac.state+" t="+ac.currentTime.toFixed(1):"not created",decoded:NA.decoded,clips:NA.starts+" (webaudio "+NA.waStarts+", <audio> "+NA.elStarts+")",audioEl:voice.paused?"paused":"playing t="+voice.currentTime.toFixed(1),silentLoop:NA.silOn,
       perm:VO.perm,primed:VO.primed,flaky:VO.flaky,okAttempts:VO.ok,hangs:VO.fails,question:VO.ctx?VO.ctx.key+" / "+VO.ctx.st:"-"};
     var head=VSTART.slice(), tail=VLOG.slice(-80);
     d.querySelector("pre").textContent="UA: "+UAS+"\nURL: "+location.protocol+"//"+location.host+location.pathname+"\n"+JSON.stringify(info)+"\n\n"+head.join("\n")+"\n…\n"+tail.join("\n"); }
   window.voDbgPaint=function(){ if(d&&d.classList.contains("on")) paint(); };
   function build(){ d=document.createElement("div"); d.id="voDbg";
-    d.innerHTML='<div class="vdH"><b>Chẩn đoán giọng nói</b><button data-a="test">Thử micro</button><button data-a="copy">Chép</button><button data-a="x">Đóng</button></div><pre></pre>';
+    d.innerHTML='<div class="vdH"><b>Chẩn đoán giọng nói</b><button data-a="test">Thử micro</button><button data-a="path">Đổi đường tiếng</button><button data-a="copy">Chép</button><button data-a="x">Đóng</button></div><pre></pre>';
     document.body.appendChild(d);
     d.addEventListener("click",function(e){ var a=e.target.getAttribute&&e.target.getAttribute("data-a"); if(!a) return; unlock();
       if(a==="x") d.classList.remove("on"); else if(a==="test") voSelfTest();
+      else if(a==="path"){ NA.path=NA.path==="webaudio"?"audio-element":"webaudio"; NA.why="switched in debug panel"; try{ if(NA.path==="audio-element") localStorage.setItem("na_path",NA.path); else localStorage.removeItem("na_path"); }catch(x){} voLog("narration path -> "+NA.path); naGesture(); paint(); }
       else if(a==="copy"){ var t=d.querySelector("pre").textContent; try{ navigator.clipboard.writeText(t).then(function(){ voLog("log copied"); }); }catch(x){ voLog("copy failed"); } } }); }
   window.voDbgToggle=function(){ if(!d) build(); d.classList.toggle("on"); voLog("debug panel "+(d.classList.contains("on")?"open":"closed")); paint(); };
   $("title").addEventListener("click",function(){ var now=Date.now(); taps=taps.filter(function(t){ return now-t<3000; }); taps.push(now); if(taps.length>=5){ taps=[]; voDbgToggle(); } });
   if(/vodebug/.test(location.search+location.hash)) setTimeout(voDbgToggle,300); })();
 /* stand-alone mic test from the debug panel: logs every event of one fresh recognition (vi-VN, 8 s) */
-function voSelfTest(){ if(!SRC){ voLog("TEST: no SpeechRecognition in this browser"); return; } voStop(); SQ++; stopVoice(); var r; try{ r=new SRC(); }catch(e){ voLog("TEST: constructor threw "+e); return; }
+function voSelfTest(){ if(!SRC){ voLog("TEST: no SpeechRecognition in this browser"); return; } voStop(); SQ++; stopVoice(); naForMic("self-test"); var r; try{ r=new SRC(); }catch(e){ voLog("TEST: constructor threw "+e); return; }
   r.lang="vi-VN"; r.interimResults=true; r.maxAlternatives=5; var t0=Date.now(); function L(m){ voLog("TEST +"+((Date.now()-t0)/1000).toFixed(1)+"s "+m); }
   ["start","audiostart","soundstart","speechstart","speechend","soundend","audioend","end","nomatch"].forEach(function(ev){ r["on"+ev]=function(){ L(ev); }; });
   r.onresult=function(e){ var R=e.results[e.results.length-1], a=[]; for(var i=0;i<R.length;i++) a.push(R[i].transcript); L((R.isFinal?"final ":"interim ")+JSON.stringify(a)); };
@@ -1684,7 +1782,7 @@ document.addEventListener("touchstart",function(e){ var t=e.touches[0]; sx=t.cli
   sOK=!e.target.closest("#car,#strip,#game,#cvEarth,#phase,#menu,#think,.ans,.stage,.stepbar"); },{passive:true});
 document.addEventListener("touchend",function(e){ if(!sOK) return; var t=e.changedTouches[0], dx=t.clientX-sx, dy=t.clientY-sy;
   if(Math.abs(dx)>70&&Math.abs(dx)>1.7*Math.abs(dy)&&Date.now()-st<800){ if(dx<0) next(); else prev(); } },{passive:true});
-document.addEventListener("touchmove",function(e){ if(!e.target.closest("#capScroll,#think,#cred,#car,#menuCard,#ecar,.pills,#voDbg,#voBanner")) e.preventDefault(); },{passive:false});
+document.addEventListener("touchmove",function(e){ if(!e.target.closest("#capScroll,#think,#cred,#car,#menuCard,#ecar,.pills,#voDbg,#voBanner,#naBanner")) e.preventDefault(); },{passive:false});
 document.addEventListener("gesturestart",function(e){e.preventDefault();});
 /* toggles */
 var ICON_ON='<path d="M4 9v6h4l5 4V5L8 9z" fill="#1f6f86"/><path d="M16 8.5a5 5 0 0 1 0 7M18.6 6a8.6 8.6 0 0 1 0 12" stroke="#1f6f86" stroke-width="1.8" fill="none" stroke-linecap="round"/>';
@@ -1693,7 +1791,7 @@ function setSound(on){ soundOn=on; $("muteBtn").setAttribute("aria-pressed",Stri
 $("muteBtn").addEventListener("click",function(){ unlock(); setSound(!soundOn); if(soundOn) clickSnd(); });
 $("autoBtn").addEventListener("click",function(){ unlock(); autoOn=!autoOn; this.setAttribute("aria-pressed",String(autoOn)); clickSnd(); });
 setSound(true);
-function unlock(){ if(unlocked) return; unlocked=true; var a=actx(); voLog("first tap: audio unlocked ("+(a?a.state:"no Web Audio")+")"); if(a){ try{ var b=a.createBuffer(1,1,22050),s=a.createBufferSource(); s.buffer=b; s.connect(a.destination); s.start(0); }catch(e){} } }
+function unlock(){ naGesture(); if(unlocked) return; unlocked=true; voLog("first tap: AudioContext "+(ac?ac.state:"none")+", narration "+NA.path+", audioSession "+asDesc()); naCheckAfterStart(); }
 ["touchend","click"].forEach(function(ev){ document.addEventListener(ev,unlock,{once:true,capture:true}); });
 document.addEventListener("visibilitychange",function(){ if(document.hidden) stopVoice(); });
 function setH(){ if(!(window.CSS&&CSS.supports&&CSS.supports("height","100dvh"))) document.documentElement.style.setProperty("--app-h",window.innerHeight+"px"); if(page===8) gameLayout(); if(page===5) stripSize(); }
